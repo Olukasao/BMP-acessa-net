@@ -1,199 +1,108 @@
-# AcessaBMP
+<div align="center">
 
-Instalacao isolada do [OpenBMP](https://github.com/OpenBMP/obmp-docker) nesta VM,
-preparada para uso futuro pelo projeto AcessaRoute. Esta instalacao e independente
-de qualquer outra aplicacao, Nginx, banco de dados ou container ja existente na VM.
+# BGP Timeline
 
-## Localizacao
+**Infraestrutura de monitoramento BGP com histórico de rotas.**
+Coleta rotas direto dos roteadores via BMP e guarda tudo em um banco consultável.
 
-- Projeto: diretorio onde este repositorio foi clonado
-- Dados persistentes: configurados por `OBMP_DATA_ROOT` no `.env`
-- Repositorio oficial (referencia, nao editar): `source/`
-  (commit `3f38af5` - "Version 2.2.3 updates")
+![BGP](https://img.shields.io/badge/BGP-monitoring-0A66C2)
+![BMP](https://img.shields.io/badge/BMP-RFC%207854-informational)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-TimescaleDB-4169E1?logo=postgresql&logoColor=white)
+![Grafana](https://img.shields.io/badge/Grafana-dashboards-F46800?logo=grafana&logoColor=white)
 
-## Estrutura
+</div>
 
+---
+
+## O que é
+
+Uma implantação **isolada e endurecida do [OpenBMP](https://github.com/OpenBMP/obmp-docker)** para acompanhar o comportamento das rotas BGP de uma rede. Os roteadores de borda enviam suas tabelas e atualizações pelo protocolo **BMP** (BGP Monitoring Protocol, [RFC 7854](https://www.rfc-editor.org/rfc/rfc7854)), e o sistema armazena o estado atual e o histórico das atualizações recebidas em PostgreSQL, com visualização no Grafana.
+
+Serve de base para responder, por consulta ou painel, perguntas como *"quais prefixos estão ativos?"*, *"por qual caminho de AS eles chegam?"* e *"o que mudou, e quando?"*.
+
+> **Não é um app web escrito do zero.** O coletor, o banco e o processamento vêm do OpenBMP, projeto da Cisco. O trabalho deste repositório está na **implantação, na configuração segura e na operação**, descritas abaixo.
+
+## O que foi feito neste repositório
+
+O compose oficial do OpenBMP foi copiado e adaptado. As diferenças:
+
+| Tema | Mudança |
+|---|---|
+| **Credenciais** | A senha padrão `openbmp` saiu. Banco e Grafana usam segredos definidos em `.env`, que nunca é versionado. |
+| **Exposição de rede** | Kafka, PostgreSQL, API e whois só escutam em `127.0.0.1`. A única porta pública é a `5000`, que recebe o BMP dos roteadores. |
+| **Grafana** | Acesso anônimo e cadastro de usuários desligados. Escuta só em `127.0.0.1`, com a interface configurável por variável. |
+| **Banco** | O Grafana lê por um usuário **somente leitura** (`grafana_reader`), com `sslmode=require`. |
+| **Permissões** | Em vez do `chmod 777` sugerido no projeto oficial, cada container recebe apenas a permissão de que precisa (mapeamento de UID por serviço). |
+| **Dados** | Todos os dados persistentes ficam fora do repositório, em um caminho configurável (`OBMP_DATA_ROOT`). |
+| **Operação** | Scripts de `start`, `stop`, `status` e `logs`, desenhados para **nunca** apagar volumes. |
+| **Painel** | Dashboard próprio provisionado automaticamente: roteadores, peers, prefixos ativos e última atualização. |
+
+## Arquitetura
+
+```text
+roteadores de borda
+        │  BMP (TCP 5000)
+        ▼
+  ┌───────────┐    ┌───────┐    ┌─────────────────┐    ┌─────────────────────┐
+  │ Collector │───►│ Kafka │───►│ psql-app        │───►│ PostgreSQL          │
+  │ (OpenBMP) │    │ + ZK  │    │ (grava rotas e  │    │ (TimescaleDB)       │
+  └───────────┘    └───────┘    │  histórico)     │    └──────────┬──────────┘
+                                └─────────────────┘               │ somente leitura
+                                                                  ▼
+                                                            ┌───────────┐
+                                                            │  Grafana  │
+                                                            └───────────┘
 ```
-AcessaBMP/
-├── source/           # clone oficial do obmp-docker (NAO editar diretamente)
-├── config/           # reservado para configuracoes locais adicionais
-├── scripts/          # start.sh, stop.sh, status.sh, logs.sh
-├── backups/          # reservado para backups futuros
-├── logs/             # reservado para logs locais (fora dos containers)
-├── .env              # variaveis e credenciais locais (nao versionar)
-├── .env.example      # modelo sem credenciais reais
-├── docker-compose.yml
-└── README.md
 
-<OBMP_DATA_ROOT>/
-├── config/                 # /config compartilhado entre collector e psql-app
-├── kafka-data/
-├── zk-data/
-├── zk-log/
-├── postgres/data/
-├── postgres/ts/
-└── grafana/
-    ├── dashboards/
-    └── provisioning/
-```
+| Serviço | Função |
+|---|---|
+| **Collector** | Recebe as sessões BMP dos roteadores. |
+| **Kafka e Zookeeper** | Fila entre a coleta e o processamento. |
+| **psql-app** | Consome a fila e grava rotas, peers e atualizações. |
+| **PostgreSQL** | Armazena o estado e o histórico. |
+| **Grafana** | Painéis de consulta. |
+| **whois** | Consulta de informações de prefixos e AS. |
 
-## Diferencas em relacao ao docker-compose.yml oficial
+## Como rodar
 
-O compose oficial (em `source/docker-compose.yml`) foi copiado e adaptado em
-`docker-compose.yml`. Alteracoes feitas, e por que:
-
-1. **Credenciais**: senha padrao `openbmp` (Postgres e Grafana) trocada por
-   valores definidos em `.env` (nunca comitados). Use senhas fortes e unicas.
-2. **Exposicao de rede**: Kafka (9092), PostgreSQL (5432), psql-app (9005) e
-   whois (4300) publicam somente em `127.0.0.1`. Grafana (3000) tambem usa
-   `127.0.0.1` por padrao; `GRAFANA_BIND_IP` permite escolher uma interface
-   especifica quando o acesso pela LAN for necessario.
-3. **Porta 5000 (BMP/Collector)**: mantida publicada em todas as interfaces
-   (`0.0.0.0:5000`), pois e o objetivo futuro do projeto: receber BMP dos
-   roteadores de borda pela rede. Restrinja o acesso a essa porta via firewall
-   aos IPs dos roteadores autorizados.
-4. **Grafana**: acesso anonimo (`GF_AUTH_ANONYMOUS_ENABLED`) desabilitado.
-   A porta e vinculada a `127.0.0.1` por padrao. Para acesso pela LAN, defina
-   `GRAFANA_BIND_IP` no `.env` para o endereco da interface desejada e limite
-   o acesso usando firewall.
-
-## Permissoes dos volumes (UID/GID por container)
-
-Nao foi usado `chmod 777`/`7777` (diferente da sugestao no README oficial).
-Em vez disso, identificamos o UID de cada imagem e aplicamos apenas o necessario:
-
-| Container         | Roda como   | Precisa de ajuste? |
-|--------------------|-------------|---------------------|
-| obmp-psql          | uid 1000    | Nao (mesmo uid do proprietario das pastas) |
-| obmp-kafka         | uid 1000    | Nao |
-| obmp-zookeeper     | uid 1000    | Nao |
-| obmp-collector     | root        | Nao (root escreve em qualquer lugar) |
-| obmp-psql-app      | root        | Nao |
-| obmp-grafana       | uid 472     | Sim: `grafana` e `grafana/provisioning` em `OBMP_DATA_ROOT` tem chown 472:472 |
-
-Nao existe (nem e necessario) o arquivo `init_db` mencionado no README oficial.
-O container `psql-app` usa a logica inversa: ele inicializa o schema
-automaticamente na primeira execucao e cria `/config/do_not_init_db` para
-nunca mais reinicializar. **NAO apague esse arquivo em producao**, ou o schema
-sera recarregado.
-
-## Uso
+Requer Docker com o Compose.
 
 ```bash
-cd /path/to/AcessaBMP
+git clone https://github.com/Olukasao/bgp-timeline.git
+cd bgp-timeline
 
-cp .env.example .env  # edite .env e substitua todos os valores de exemplo
-./scripts/start.sh     # sobe os containers (docker compose up -d)
-./scripts/stop.sh       # para os containers SEM remover volumes/dados (docker compose stop)
-./scripts/status.sh     # mostra containers, portas e uso de disco/recursos
-./scripts/logs.sh       # segue os logs de todos os servicos
+cp .env.example .env      # edite e troque todos os valores de exemplo
+./scripts/start.sh        # sobe os containers
+./scripts/status.sh       # containers, portas e uso de recursos
+./scripts/logs.sh         # acompanha os logs
+./scripts/stop.sh         # para sem apagar dados
 ```
 
-> Nota: o usuario que executa os comandos precisa ter permissao para usar Docker.
-> Se necessario, use `sudo` antes dos comandos `docker`/`docker compose`.
+Abra o Grafana em `http://127.0.0.1:3000` (usuário e senha do `.env`).
 
-**Nunca use `docker compose down -v`** neste projeto — isso apagaria os volumes
-de dados. Os scripts fornecidos usam apenas `stop`/`up -d`.
+Depois, configure o roteador de borda para enviar BMP para `<IP_DA_VM>:5000`. Enquanto nenhum roteador estiver enviando, o coletor aguarda conexões e os painéis ficam zerados, o que é normal.
 
-## BMP
+> **Nunca rode `docker compose down -v`**: isso apagaria os volumes de dados. Os scripts usam só `stop` e `up -d`.
 
-```
-TCP 5000
-```
+## Segurança
 
-Ainda não existe nenhum roteador enviando BMP para esta porta. O Collector já
-está no ar e aguardando conexões ("Ready. Waiting for connections" nos logs),
-mas nenhuma sessão BMP existe até que um roteador seja configurado.
+- Segredos só no `.env` (permissão 600), fora do Git.
+- Serviços internos presos em `127.0.0.1`.
+- **Restrinja a porta 5000 por firewall** aos IPs dos roteadores autorizados. Nenhuma regra é criada automaticamente.
+- O container do PostgreSQL roda com `privileged: true`, herança do projeto oficial (necessário para ajustes de `sysctl`). Isso não foi alterado.
+- Dados de rotas e topologia reais ficam no banco local e **não** pertencem a este repositório.
 
-### Próximo passo futuro (NÃO executado nesta instalação)
+## Estado do projeto
 
-Configurar o roteador de borda da AcessaNet para enviar BMP para:
+- Pilha OpenBMP implantada e funcionando, com Grafana e painel inicial.
+- Nenhuma sessão BMP configurada nos roteadores no momento da documentação.
+- **Próximos passos:** conectar os roteadores de borda, criar painéis de **histórico de mudanças de rota** sobre os dados já gravados e uma interface web própria para visualização.
 
-```
-<IP_DA_VM>:5000
-```
+## Documentação
 
-## Servicos e portas
+Detalhes de implantação (diferenças em relação ao compose oficial, permissões dos volumes, portas, Grafana e backup): [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
-| Servico     | Container         | Porta interna | Publicada em      |
-|-------------|--------------------|----------------|---------------------|
-| Collector   | obmp-collector     | 5000           | `0.0.0.0:5000`      |
-| Kafka       | obmp-kafka         | 9092           | `127.0.0.1:9092`    |
-| Zookeeper   | obmp-zookeeper     | 2181           | (nao publicada)     |
-| PostgreSQL  | obmp-psql          | 5432           | `127.0.0.1:5432`    |
-| PSQL App    | obmp-psql-app      | 9005           | `127.0.0.1:9005`    |
-| Grafana     | obmp-grafana       | 3000           | `127.0.0.1:3000` por padrao |
-| Whois       | obmp-whois         | 43             | `127.0.0.1:4300`    |
+## Créditos e licença
 
-## Grafana
-
-Acesso: `http://127.0.0.1:3000` por padrao. Para acesso pela LAN, configure
-`GRAFANA_BIND_IP` no `.env` para o endereco da interface escolhida e ajuste o
-firewall. Login anonimo e signup desabilitados (`GF_AUTH_ANONYMOUS_ENABLED=false`,
-`GF_USERS_ALLOW_SIGN_UP=false`). Usuario administrativo: `admin` (senha em `.env`).
-
-Dashboard inicial `AcessaBMP - Overview` (uid `obmp-home`, home page padrao)
-mostra: routers, peers, prefixos ativos, ultima atualizacao, e tabelas de
-routers/peers registrados. Enquanto nenhum roteador estiver enviando BMP,
-os valores ficam zerados normalmente (nao e uma falha).
-
-### Datasource "OpenBMP"
-
-Provisionado via `<OBMP_DATA_ROOT>/grafana/provisioning/datasources/openbmp.yml`,
-conectando ao `obmp-psql:5432` pela rede Docker `acessabmp_default` (mesma
-rede dos demais containers OpenBMP — o Grafana nao precisou de rede externa
-adicional pois ja fazia parte do mesmo compose). Conexao usa `sslmode=require`.
-
-Usuario do banco: `grafana_reader`, criado com privilegios **somente leitura**
-(`CONNECT`, `USAGE` no schema `public`, `SELECT` em todas as tabelas). Sem
-INSERT/UPDATE/DELETE/CREATE/DROP/ALTER. Senha em `.env`,
-variavel `GRAFANA_READER_PASSWORD` (injetada no container Grafana como
-`OPENBMP_GRAFANA_DB_PASSWORD`, referenciada no provisioning via `$OPENBMP_GRAFANA_DB_PASSWORD`).
-
-Para validar a conexao (via API, sem expor senha):
-
-```bash
-GF_USER=$(sudo grep '^GF_ADMIN_USER=' .env | cut -d= -f2)
-GF_PASS=$(sudo grep '^GF_ADMIN_PASSWORD=' .env | cut -d= -f2)
-GRAFANA_BIND_IP=$(sudo grep '^GRAFANA_BIND_IP=' .env | cut -d= -f2)
-GF_URL="http://${GRAFANA_BIND_IP:-127.0.0.1}:3000"
-curl -s -u "${GF_USER}:${GF_PASS}" -X POST "${GF_URL}/api/ds/query" \
-  -H "Content-Type: application/json" \
-  -d '{"queries":[{"refId":"A","datasource":{"type":"postgres","uid":"openbmp"},"rawSql":"SELECT 1","format":"table"}]}'
-```
-
-### Dashboards provisionados
-
-Apenas o dashboard proprio `AcessaBMP - Overview` (criado nesta instalacao).
-Nao foram encontrados dashboards Grafana oficiais compatíveis no clone em
-`source/` do obmp-docker (nenhum `.json` de dashboard no repositorio oficial
-nesse commit).
-
-### Backup do Grafana
-
-Dados persistentes em `<OBMP_DATA_ROOT>/grafana` (SQLite interno + provisioning).
-Para backup a frio (containers parados, sem afetar OpenBMP):
-
-```bash
-sudo ./scripts/stop.sh   # ou: docker compose stop grafana (sem afetar os demais)
-OBMP_DATA_ROOT=$(grep '^OBMP_DATA_ROOT=' .env | cut -d= -f2)
-sudo tar -czf backups/grafana-$(date +%Y%m%d).tar.gz -C "$OBMP_DATA_ROOT" grafana
-sudo ./scripts/start.sh
-```
-
-Nunca use `docker compose down -v` — isso apagaria os volumes de dados.
-
-## Credenciais
-
-Guardadas somente em `.env` (permissao 600). Nao estao
-documentadas aqui nem em nenhum outro lugar em texto pleno. Inclui agora
-tambem `GRAFANA_READER_PASSWORD` (usuario read-only `grafana_reader` no
-PostgreSQL, usado exclusivamente pelo datasource do Grafana).
-
-## Observacoes de seguranca conhecidas (heranca do projeto oficial)
-
-- O container `obmp-psql` roda com `privileged: true` no compose oficial
-  (necessario para os `sysctls` de tcp_keepalive usados pelo TimescaleDB/Patroni).
-  Isso nao foi alterado nesta instalacao.
-- Configure o firewall do host para restringir a porta 5000 aos IPs dos
-  roteadores autorizados. Nenhuma regra de firewall e criada automaticamente.
+Baseado no [OpenBMP](https://github.com/OpenBMP/obmp-docker), da Cisco Systems, distribuído sob licença **BSD de 3 cláusulas**. O texto original está em [source/LICENSE](source/LICENSE), e a cópia do projeto oficial em `source/` não foi modificada. Ao redistribuir, mantenha o aviso de direitos autorais e os termos dessa licença.
